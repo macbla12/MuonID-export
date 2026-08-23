@@ -34,7 +34,7 @@ void example() {
 
     // Prog decyzyjny na P(muon) - DOPASUJ do tego, na czym ustalales
     // punkt pracy (working point) dla dwoch modeli ONNX w MuonID.cxx.
-    const double MUON_ID_CUT = 0.5;
+    const double MUON_ID_CUT = 0.3;
 
     //const std::string pattern = "/run/media/epic/Data/Background/Muons/Continuous/reco_*.root";
     const std::string pattern ="/run/media/epic/Data/Muons/Grape-10x275/Current/reco10x275_221.root";
@@ -53,13 +53,19 @@ void example() {
 
     podio::ROOTReader reader;
     reader.openFiles(infiles);
+    double count = 0;
 
     // -------- histograms --------
-    TH1F *h_mom_mc = new TH1F("h_mom_mc", "; p [GeV]; events", 100, 0, 20);
-    TH1F *h_mom_reco = new TH1F("h_mom_reco", "; p [GeV]; events", 100, 0, 20);
+    TH1F *h_mom_mc = new TH1F("h_mom_mc", "; p [GeV]; events", 100, 0, 5);
+    TH1F *h_mom_reco = new TH1F("h_mom_reco", "; p [GeV]; events", 100, 0, 5);
+    TH1D *h_eff = (TH1D*)h_mom_reco->Clone("h_eff");
+    h_eff->Reset(); 
+    h_eff->Sumw2();
+    h_mom_reco->Sumw2();
+    h_mom_mc->Sumw2();
 
     // -------- event loop --------
-    const auto n_events = 3000;
+    const auto n_events = 4500;
     int qt = 0;
     for (size_t iev = 0; iev < n_events; ++iev) {
         const auto event = podio::Frame(reader.readNextEntry("events"));
@@ -88,24 +94,24 @@ void example() {
                 if (rcp.getTracks().size() == 0 || rcp.getClusters().size() == 0)
                     qt += 1;
                 double p_value = MuonID(rcp, &event);
+                count++;
+                cout<<p_value << endl;
                 if (p_value > MUON_ID_CUT)
                     h_mom_reco->Fill(edm4hep::utils::magnitude(mom));
+                    
             }
         }
     }
 
     // -------- efficiency --------
-    double eff = h_mom_reco->Integral() / h_mom_mc->Integral();
-    cout << "No track or cluster : " << (double)qt / h_mom_mc->Integral() << " %\n";
-    cout << "Efficiency (tot) : " << eff << " %\n";
+    double eff = h_mom_reco->GetEntries() / h_mom_mc->GetEntries();
+    cout << "No track or cluster : " << (double)qt / h_mom_mc->GetEntries()<<endl;
+    cout << "Efficiency (reco) : " << count/h_mom_mc->GetEntries()<<endl;
+    cout << "Efficiency (tot) : " << eff<<endl;
 
     // -------- draw histograms --------
     gStyle->SetOptStat(0);
-    TCanvas *c1 = new TCanvas("c1", "c1", 800, 600);
-    h_mom_mc->SetLineColor(kRed);
-    h_mom_mc->Draw("HIST");
-    h_mom_reco->SetLineColor(kBlue);
-    h_mom_reco->Draw("HIST SAME");
+
     TLegend *legend = new TLegend(0.6, 0.6, 0.8, 0.7);
     legend->AddEntry(h_mom_mc, "MC truth", "l");
     legend->AddEntry(h_mom_reco, "Reco", "l");
@@ -113,5 +119,22 @@ void example() {
     legend->SetFillStyle(0);
     legend->SetTextSize(0.03);
     legend->Draw();
+
+    TCanvas *c1 = new TCanvas("c1", "c1", 800, 600);
+    h_mom_mc->SetLineColor(kRed);
+    h_mom_mc->Draw("HIST");
+    h_mom_reco->SetLineColor(kBlue);
+    h_mom_reco->Draw("HIST SAME");
+
+    
     c1->SaveAs("muID.pdf");
+
+    TCanvas *c2 = new TCanvas("c2", "c2", 800, 600);
+
+    h_eff->Divide(h_mom_reco, h_mom_mc, 1.0, 1.0, "B");
+
+    h_eff->SetTitle("Muon ID Efficiency;p [GeV/c];Efficiency");
+    h_eff->Draw("e1");
+
+    c2->SaveAs("muID_efficiency.pdf");
 }

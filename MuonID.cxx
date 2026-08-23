@@ -342,10 +342,10 @@ void InitMuonIDSessions()
     session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
     // high-P: model calo-only, 30 cech (patrz build_raw_features w TestingMacro.cxx)
-    g_session_highP = std::make_unique<Ort::Session>(*g_ort_env, "CalorimetryHits/ONNX/xgb_muonID.onnx", session_options);
+    g_session_highP = std::make_unique<Ort::Session>(*g_ort_env, "../CalorimetryHits/ONNX/xgb_muonID.onnx", session_options);
     // low-P: model calo(uproszczone)+ToF+kinematyka, 21 cech
     // (patrz build_raw_features_from_components w TestingMacro_Fixed.cxx)
-    g_session_lowP  = std::make_unique<Ort::Session>(*g_ort_env, "ToF/ONNX/xgb_muonID.onnx", session_options);
+    g_session_lowP  = std::make_unique<Ort::Session>(*g_ort_env, "../ToF/ONNX/xgb_muonID.onnx", session_options);
 
     g_mem_info = std::make_unique<Ort::MemoryInfo>(
         Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
