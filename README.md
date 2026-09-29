@@ -1,18 +1,18 @@
 # MuonID
 
-Ten katalog zawiera główną implementację funkcji identyfikacji mionów (`MuonID`) w ramach analiz EPIC.
+This directory contains the main implementation of the muon identification function (`MuonID`) within the EPIC analysis framework.
 
-## Zawartość katalogu
+## Directory contents
 
-- **`MuonID.cxx`** — główna funkcja `MuonID(...)` obliczająca prawdopodobieństwo identyfikacji mionu dla zadanej trajektorii (*track*) oraz ramki zdarzenia. Nie pętluje po zdarzeniach ani nie generuje histogramów (to zadanie analizy głównej).
-- **`example.cxx`** — przykładowe użycie funkcji `MuonID`.
-- **`ToFSim.cxx`** — makro pomocnicze/symulacyjne dla detektora ToF.
-- **`ONNX/`** — wyeksportowane modele klasyfikatorów używane przez funkcję `MuonID`.
-- **Pliki wyjściowe / wykresy:** `muID.pdf`, `muID_efficiency.pdf`, `MuonID_Histograms.root` — wygenerowane wykresy wydajności i walidacji.
+- **`MuonID.cxx`** — the main `MuonID(...)` function that computes the probability of a muon being identified for a given track and event frame. It does not loop over events or generate histograms (that is the responsibility of the main analysis).
+- **`example.cxx`** — example usage of the `MuonID` function.
+- **`ToFSim.cxx`** — auxiliary/simulation macro for the ToF detector.
+- **`ONNX/`** — exported classifier models used by the `MuonID` function.
+- **Output files / plots:** `muID.pdf`, `muID_efficiency.pdf`, `MuonID_Histograms.root` — generated performance and validation plots.
 
-## Wymagania i uruchomienie
+## Requirements and startup
 
-Przed uruchomieniem upewnij się, że znajdujesz się w środowisku **EIC Shell** oraz że zmienne dla biblioteki **ONNX Runtime** są skonfigurowane:
+Before running, make sure you are in the **EIC Shell** environment and that the **ONNX Runtime** library environment variables are configured:
 
 ```bash
 source /usr/local/eic/eic-shell
