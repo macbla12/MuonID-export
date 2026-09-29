@@ -159,16 +159,3 @@ ToFResults ToFSim(TLorentzVector particle, int charge, TVector3 TOF_pos)
     }
     return {best_length, DistanceCheck, smallest_distance};
 }
-/*
-double DiLeptonMass(double L1, double L2, double p1, double p2, double dt)
-{
-    L1=L1/1.97327e-14;
-    L2=L2/1.97327e-14;
-    dt=dt/ 6.5821e-16;
-
-    double A=-2*(L1*L1)*(L2*L2)/((p1*p1)*(p2*p2))+pow(L1,4)/pow(p1,4)+pow(L2,4)/pow(p2,4);
-    double B=-2*(L1*L1)*(L2*L2)*((1/(p1*p1))+(1/(p2*p2)))+2*pow(L1,4)/(p1*p1)+2*pow(L2,4)/(p2*p2)-2*(dt*dt)*((L1*L1)/(p1*p1)+(L2*L2)/(p2*p2));
-    double C=pow(dt,4)-2*(dt*dt)*((L1*L1)+(L2*L2))+pow(L1,4)+pow(L2,4)-2*(L1*L1)*(L2*L2);
-    return (-B+sqrt((B*B)-4*A*C))/(2*A);
-}
-*/

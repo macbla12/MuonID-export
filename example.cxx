@@ -112,7 +112,7 @@ void example() {
     h_eta_id->Sumw2();
 
     // -------- event loop --------
-    const auto n_events = 100000;
+    const auto n_events = 1000;
     for (size_t iev = 0; iev < n_events; ++iev) {
         const auto event = podio::Frame(reader.readNextEntry("events"));
         if (iev % 1000 == 0)
@@ -127,7 +127,7 @@ void example() {
             const int pdg = mcp.getPDG();
             const double mc_eta = edm4hep::utils::eta(mom);
 
-            bool mc_in_acceptance = (mc_eta > -1.25 && mc_eta < 3.5);
+            bool mc_in_acceptance = (mc_eta > -1.0 && mc_eta < 3.5);
             bool mc_in_crack = (mc_eta > 1.0 && mc_eta < 1.3);
 
             if (std::abs(pdg) == 13 && mc_in_acceptance && !mc_in_crack) {
@@ -167,7 +167,7 @@ void example() {
             const double p   = edm4hep::utils::magnitude(mom);
             const double eta = edm4hep::utils::eta(mom);
 
-            bool in_acceptance = (eta > -1.25 && eta < 3.5);
+            bool in_acceptance = (eta > -1.0 && eta < 3.5);
             bool in_crack = (eta > 1.0 && eta < 1.3);
 
             if (!in_acceptance || in_crack) continue;

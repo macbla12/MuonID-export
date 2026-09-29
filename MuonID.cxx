@@ -75,10 +75,10 @@ static constexpr double P_SPLIT_GEV = 1.0;
 // 41-feature RAW_COLS layout (see TrainMuonID.py / CombinedCaloToFAnalysis.cxx),
 // not the old 21-feature simple-calo-features model.
 static const char* LOWP_ONNX_PATH =
-    "../ToF/ONNX/xgb_muonID.onnx";
+    "ONNX/xgb_muonID_LowP.onnx";
 
 static const char* HIGHP_ONNX_PATH =
-    "../CalorimetryHits/ONNX/xgb_muonID.onnx";
+    "ONNX/xgb_muonID_HighP.onnx";
 
 static constexpr double TIMING_CUT_NS = 20.0;
 
