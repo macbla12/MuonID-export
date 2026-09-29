@@ -15,5 +15,5 @@ This directory contains the main implementation of the muon identification funct
 Before running, make sure you are in the **EIC Shell** environment and that the **ONNX Runtime** library environment variables are configured:
 
 ```bash
-source /usr/local/eic/eic-shell
-source ../onnx_setup.sh
+eic-shell
+onnx_setup.sh
