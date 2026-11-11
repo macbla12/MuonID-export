@@ -1,1449 +1,622 @@
 // MuonID.cxx
 //
-// Combined MuonID:
-//   track p < P_SPLIT_GEV  -> LowP model: full Calo shower-shape + ToF
-//   track p >= P_SPLIT_GEV -> HighP model: detailed Calo
+// MuonID zgodne 1:1 z TestingMacro_MuonID_LowHigh.cxx:
+//   p <= P_SPLIT_GEV -> xgb_muonID_LowP.onnx  (Calo + ToF, 41 cech)
+//   p >  P_SPLIT_GEV -> xgb_muonID_HighP.onnx (Calo, 30 cech)
 //
-// Public interface:
+// Plik jest #include-owany jako zrodlo (example.cxx), wiec:
+//   - NIE definiuje ExpandGlob ani main (jest w example),
+//   - eksportuje: P_SPLIT_GEV oraz
+//       float MuonID(const edm4eic::ReconstructedParticle &rcp,
+//                    const podio::Frame *event, bool *hasDetectorInfo);
 //
-//   float MuonID(const edm4eic::ReconstructedParticle& rcp,
-//                const podio::Frame* event,
-//                bool* hasDetectorInfo = nullptr);
-//
-// Returns:
-//   P(muon)
-//
-// hasDetectorInfo (optional out-param):
-//   Set to true only if the track left enough of a signal in the
-//   calorimeters/ToF to actually run the model on it (the same "keep"
-//   condition used by TestingMacro_Combined_Podio.cxx to decide whether a
-//   track counts toward "Total" there). Set to false in every other case
-//   (no event, trackP<=0, or no usable detector info at all) -- in all of
-//   those cases the returned P(muon) is a meaningless 0.0f, NOT a genuine
-//   "identified as not-muon" score, and callers that want a proper
-//   "found & capable of ID" vs "correctly identified" efficiency (as
-//   opposed to a single "identified / reconstructed" number) need this
-//   flag to tell the two situations apart.
-//
-// The function itself does NOT:
-//   - perform truth selection
-//   - apply a MuonID cut
-//   - fill histograms
-//   - run over events
-//   - print performance numbers
-//
-// Those things belong in the testing macro (example()).
+// hasDetectorInfo == false  <=>  w makrze testowym trak by zostal pominiety
+// (`continue`): brak sladu/ToF/calo dla modelu Low, brak calo dla modelu High.
 
-#include <TH1.h>
-#include <TH2.h>
-#include <TROOT.h>
+#pragma once
+
 #include <TLorentzVector.h>
 #include <TVector3.h>
 #include <TVector2.h>
 #include <TMath.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <set>
+#include <map>
+#include <memory>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 
 #include <onnxruntime_cxx_api.h>
 
 #include <podio/Frame.h>
 
-#include <edm4hep/MCParticleCollection.h>
 #include <edm4eic/ReconstructedParticleCollection.h>
-#include <edm4eic/MCRecoParticleAssociationCollection.h>
 #include <edm4eic/ClusterCollection.h>
-#include <edm4eic/MCRecoClusterParticleAssociationCollection.h>
+#include <edm4eic/TrackClusterMatchCollection.h>
 #include <edm4eic/CalorimeterHitCollection.h>
 #include <edm4eic/TrackerHitCollection.h>
+#include <edm4eic/TrackSegmentCollection.h>
 
-#include <string>
-#include <vector>
-#include <memory>
-#include <algorithm>
-#include <cmath>
-#include <iostream>
+using namespace std;
 
-#include "ToFSim.cxx"
+// =============================================================================
+// Ustawienia (identyczne jak w makrze testowym)
+// =============================================================================
+static const double P_SPLIT_GEV = 0.7;
 
+// Sciezki do modeli (mozna nadpisac zmiennymi srodowiskowymi)
+static const char *MUONID_LOW_MODEL_DEFAULT  = "ONNX/xgb_muonID_LowP.onnx";
+static const char *MUONID_HIGH_MODEL_DEFAULT = "ONNX/xgb_muonID_HighP.onnx";
 
-// ============================================================================
-// Configuration
-// ============================================================================
+namespace MuonIDImpl {
 
-static constexpr double P_SPLIT_GEV = 1.0;
+static const string SEG_COLL = "CentralTrackSegments";
 
-// Change these paths if necessary.
-// NOTE: LOWP_ONNX_PATH must point at a model retrained on the FULL
-// 41-feature RAW_COLS layout (see TrainMuonID.py / CombinedCaloToFAnalysis.cxx),
-// not the old 21-feature simple-calo-features model.
-static const char* LOWP_ONNX_PATH =
-    "ONNX/xgb_muonID_LowP.onnx";
+static constexpr double c_light = 299.792458;   // [mm/ns]
 
-static const char* HIGHP_ONNX_PATH =
-    "ONNX/xgb_muonID_HighP.onnx";
+// Korekta vz dla ToF: t_corr = t_hit - T0_PER_MM * vz
+static const bool   CORRECT_T0   = true;
+static const double T0_PER_MM    = -1.0 / c_light;
+static const bool   CUT_BAD_PATH = true;
+static const double L_TOL        = 10.0;   // [mm]
 
-static constexpr double TIMING_CUT_NS = 20.0;
+// Pomijanie hitow EcalBarrelImagingRecHits w ECal (jak w treningu LowP)
+static const bool SKIP_IMAGING_HITS = true;
 
-static constexpr float MISSING_SENTINEL = -999.f;
+// Okna geometryczne ToF [mm]
+static const double BTOF_RMIN = 600,  BTOF_RMAX = 720,  BTOF_ZMAX = 1200;
+static const double FTOF_ZMIN = 1750, FTOF_ZMAX = 1950, FTOF_RMIN = 100, FTOF_RMAX = 650;
 
+static const float MISSING_SENTINEL = -999.f;
 
-// ============================================================================
-// Detector association helper
-// ============================================================================
+// Parametry dopasowania ToF (jak w makrze)
+static const double DR_CUT_BARREL   = 0.8;
+static const double DR_CUT_ENDCAP   = 0.8;
+static const double DIST_CUT_BARREL = 6.0;
+static const double DIST_CUT_ENDCAP = 6.0;
 
+// =============================================================================
+// Narzedzia
+// =============================================================================
+inline bool HasCollection(const vector<string> &names, const string &n)
+{
+    return find(names.begin(), names.end(), n) != names.end();
+}
+
+inline bool InBarrelTOF(double x, double y, double z)
+{
+    const double R = std::hypot(x, y), az = std::fabs(z);
+    return (R >= BTOF_RMIN && R <= BTOF_RMAX && az <= BTOF_ZMAX);
+}
+
+inline bool InEndcapTOF(double x, double y, double z)
+{
+    const double R = std::hypot(x, y), az = std::fabs(z);
+    return (az >= FTOF_ZMIN && az <= FTOF_ZMAX && R >= FTOF_RMIN && R <= FTOF_RMAX);
+}
+
+// =============================================================================
+// Kalorymetry
+// =============================================================================
 struct DetectorAssoc
 {
-    std::string clusterName;
-    std::string assocCollName;
+    string clusterName;
+    string matchCollName;
 };
 
-
-static DetectorAssoc MakeDetectorAssoc(const std::string& clusterName)
+inline DetectorAssoc MakeDetectorAssoc(const string &clusterName)
 {
     DetectorAssoc d;
-
-    d.clusterName = clusterName;
-
-    // e.g.
-    // EcalBarrelImagingClusters
-    //              ->
-    // EcalBarrelImagingClusterAssociations
-    d.assocCollName =
-        clusterName.substr(0, clusterName.size() - 1)
-        + "Associations";
-
+    d.clusterName   = clusterName;
+    d.matchCollName = clusterName.substr(0, clusterName.size() - string("Clusters").size()) + "TrackClusterMatches";
     return d;
 }
 
-
-// ============================================================================
-// ONNX inference
-// ============================================================================
-
-static float run_muon_id(
-    Ort::Session& session,
-    Ort::MemoryInfo& memoryInfo,
-    const std::vector<float>& raw)
-{
-    int64_t shape[2] = {
-        1,
-        static_cast<int64_t>(raw.size())
-    };
-
-    Ort::Value inputTensor =
-        Ort::Value::CreateTensor<float>(
-            memoryInfo,
-            const_cast<float*>(raw.data()),
-            raw.size(),
-            shape,
-            2
-        );
-
-    const char* inputNames[] = {"raw_features"};
-    const char* outputNames[] = {"probabilities"};
-
-    auto output = session.Run(
-        Ort::RunOptions{nullptr},
-        inputNames,
-        &inputTensor,
-        1,
-        outputNames,
-        1
-    );
-
-    float* probs =
-        output[0].GetTensorMutableData<float>();
-
-    // probabilities = [P(pion), P(muon)]
-    return probs[1];
-}
-
-
-// ============================================================================
-// SHARED CALO FEATURES (full shower-shape set)
-//
-// Used by BOTH the HighP path (29-feature model, no ToF) and the LowP path
-// (41-feature model, full calo + ToF). Kept the "HighP_*" names since the
-// computation itself is identical for both regimes -- only what gets built
-// into the final raw-feature vector differs.
-// ============================================================================
-
-struct HighP_TrackCalHits
+struct TrackCalHits
 {
     double sumEnergy = 0.0;
-
-    double phiMin = 1e9;
-    double phiMax = -1e9;
-
-    double etaMin = 1e9;
-    double etaMax = -1e9;
-
-    double Rmin = 1e9;
-    double Rmax = -1e9;
-
+    double phiMin = 1e9, phiMax = -1e9;
+    double etaMin = 1e9, etaMax = -1e9;
+    double Rmin = 1e9, Rmax = -1e9;
     double maxHitE = -1.0;
-
-    std::vector<double> R;
-    std::vector<double> dEta;
-    std::vector<double> dPhi;
-    std::vector<double> E;
+    vector<double> R, dEta, dPhi, E;
 };
 
-
-static HighP_TrackCalHits HighP_CollectHits(
-    const edm4hep::MCParticle& simPart,
-    const std::vector<DetectorAssoc>& detectors,
-    const podio::Frame& frame,
-    const TLorentzVector& particle,
-    double timingCutNs)
+// ECal: rcp.getClusters(); HCal: klastry z TrackClusterMatch dla tracka tej czastki.
+inline TrackCalHits CollectHits(const edm4eic::ReconstructedParticle &rcp,
+                                const vector<DetectorAssoc> &detectors,
+                                const podio::Frame &frame,
+                                const vector<string> &availNames,
+                                bool fromRcpClusters,
+                                const TLorentzVector &Partic)
 {
-    HighP_TrackCalHits result;
+    TrackCalHits result;
+    vector<edm4eic::Cluster> clusters;
+    set<podio::ObjectID> imagingHitIDs;
 
-    for (const auto& det : detectors)
+    if (fromRcpClusters)
     {
-        const auto& assocColl =
-            frame.get<
-                edm4eic::MCRecoClusterParticleAssociationCollection
-            >(det.assocCollName);
+        for (const auto &c : rcp.getClusters()) clusters.push_back(c);
 
-        for (const auto& assoc : assocColl)
+        if (SKIP_IMAGING_HITS && !clusters.empty())
         {
-            if (assoc.getSim() != simPart)
-                continue;
-
-            const auto cluster = assoc.getRec();
-
-            for (const auto& hit : cluster.getHits())
+            if (HasCollection(availNames, "EcalBarrelImagingRecHits"))
             {
-                const float hitE = hit.getEnergy();
-                const float hitT = hit.getTime();
-
-                if (hitT > timingCutNs)
-                    continue;
-
-                const auto pos = hit.getPosition();
-
-                TVector3 hitVec(
-                    pos.x,
-                    pos.y,
-                    pos.z
-                );
-
-                const double hitEta = hitVec.Eta();
-                const double hitPhi = hitVec.Phi();
-
-                const double R =
-                    std::sqrt(
-                        pos.x * pos.x +
-                        pos.y * pos.y
-                    );
-
-                const double dEta =
-                    hitEta - particle.Eta();
-
-                const double dPhi =
-                    TVector2::Phi_mpi_pi(
-                        hitPhi - particle.Phi()
-                    );
-
-                result.sumEnergy += hitE;
-
-                result.R.push_back(R);
-                result.dEta.push_back(dEta);
-                result.dPhi.push_back(dPhi);
-                result.E.push_back(hitE);
-
-                result.phiMin =
-                    std::min(result.phiMin, hitPhi);
-
-                result.phiMax =
-                    std::max(result.phiMax, hitPhi);
-
-                result.etaMin =
-                    std::min(result.etaMin, hitEta);
-
-                result.etaMax =
-                    std::max(result.etaMax, hitEta);
-
-                result.Rmin =
-                    std::min(result.Rmin, R);
-
-                result.Rmax =
-                    std::max(result.Rmax, R);
-
-                if (hitE > result.maxHitE)
-                    result.maxHitE = hitE;
+                for (const auto &ih : frame.get<edm4eic::CalorimeterHitCollection>("EcalBarrelImagingRecHits"))
+                    imagingHitIDs.insert(ih.getObjectID());
             }
         }
     }
+    else
+    {
+        if (rcp.getTracks().empty()) return result;
+        const auto trk = rcp.getTracks().at(0);
 
+        for (const auto &det : detectors)
+        {
+            if (!HasCollection(availNames, det.matchCollName)) continue;
+            for (const auto &m : frame.get<edm4eic::TrackClusterMatchCollection>(det.matchCollName))
+                if (m.getTrack() == trk) clusters.push_back(m.getCluster());
+        }
+    }
+
+    for (const auto &cluster : clusters)
+    {
+        for (const auto &hit : cluster.getHits())
+        {
+            if (imagingHitIDs.count(hit.getObjectID())) continue;
+
+            float HitE = hit.getEnergy();
+            auto  pos  = hit.getPosition();
+
+            TVector3 hitVec(pos.x, pos.y, pos.z);
+            double hitEta = hitVec.Eta();
+            double hitPhi = hitVec.Phi();
+            double R = sqrt(pos.x * pos.x + pos.y * pos.y);
+
+            double dEta = hitEta - Partic.Eta();
+            double dPhi = TVector2::Phi_mpi_pi(hitPhi - Partic.Phi());
+
+            result.sumEnergy += HitE;
+            result.R.push_back(R);
+            result.dEta.push_back(dEta);
+            result.dPhi.push_back(dPhi);
+            result.E.push_back(HitE);
+
+            result.phiMin = min(result.phiMin, hitPhi); result.phiMax = max(result.phiMax, hitPhi);
+            result.etaMin = min(result.etaMin, hitEta); result.etaMax = max(result.etaMax, hitEta);
+            result.Rmin   = min(result.Rmin, R);        result.Rmax   = max(result.Rmax, R);
+
+            if (HitE > result.maxHitE) result.maxHitE = HitE;
+        }
+    }
     return result;
 }
 
-
-struct HighP_TrackFeatures
+struct TrackFeatures
 {
-    float Energy = 0.f;
-    float Number = 0.f;
-    float EoverP = 0.f;
-    float AvgHitEnergy = 0.f;
-
-    float SpreadPhi = 0.f;
-    float SpreadEta = 0.f;
-    float SpreadR = 0.f;
-
-    float MaxHitFrac = 0.f;
-
-    float EnergyStdDev = 0.f;
-    float EnergyConcentration = 0.f;
-
-    float R_Disp = 0.f;
-    float R_DispWeighted = 0.f;
-    float Eta_DispWeighted = 0.f;
-    float Phi_DispWeighted = 0.f;
+    float Energy = 0.f, Number = 0.f, EoverP = 0.f, AvgHitEnergy = 0.f;
+    float SpreadPhi = 0.f, SpreadEta = 0.f, SpreadR = 0.f, MaxHitFrac = 0.f;
+    float EnergyStdDev = 0.f, EnergyConcentration = 0.f;
+    float R_Disp = 0.f, R_DispWeighted = 0.f, Eta_DispWeighted = 0.f, Phi_DispWeighted = 0.f;
 };
 
-
-static HighP_TrackFeatures HighP_ComputeTrackFeatures(
-    const HighP_TrackCalHits& hits,
-    double trackP)
+inline TrackFeatures ComputeTrackFeatures(const TrackCalHits &hits, double trackP)
 {
-    HighP_TrackFeatures f;
+    TrackFeatures f;
+    if (hits.sumEnergy <= 0) return f;
 
-    if (hits.sumEnergy <= 0.0)
-        return f;
+    int n = static_cast<int>(hits.E.size());
+    if (n == 0) return f;
 
-    const int n =
-        static_cast<int>(hits.E.size());
+    double sumEnergy = hits.sumEnergy;
+    double meanE = sumEnergy / n;
 
-    if (n == 0)
-        return f;
-
-    const double sumEnergy = hits.sumEnergy;
-
-    const double meanE =
-        sumEnergy / n;
-
-    double sumSqDevE = 0.0;
-    double sumE2 = 0.0;
-
+    double sumSqDevE = 0.0, sumE2 = 0.0;
     for (double e : hits.E)
     {
-        const double devE =
-            e - meanE;
-
+        double devE = e - meanE;
         sumSqDevE += devE * devE;
         sumE2 += e * e;
     }
+    double energyStdDev = sqrt(sumSqDevE / n);
+    double energyConcentration = sumE2 / (sumEnergy * sumEnergy);
 
-    const double energyStdDev =
-        std::sqrt(sumSqDevE / n);
-
-    const double energyConcentration =
-        sumE2 / (sumEnergy * sumEnergy);
-
-    const double spreadPhi =
-        hits.phiMax - hits.phiMin;
-
-    const double spreadEta =
-        hits.etaMax - hits.etaMin;
-
-    const double spreadR =
-        hits.Rmax - hits.Rmin;
-
+    double spreadPhi = acos(cos(hits.phiMax - hits.phiMin));
+    double spreadEta = hits.etaMax - hits.etaMin;
+    double spreadR   = hits.Rmax - hits.Rmin;
 
     double sumRw = 0.0;
+    for (int k = 0; k < n; ++k) sumRw += hits.R[k] * hits.E[k];
+    double meanR_w = sumRw / sumEnergy;
 
+    double sumR2diff = 0.0, sumR2diffW = 0.0;
+    double sumDEta2diffW = 0.0, sumDPhi2diffW = 0.0;
     for (int k = 0; k < n; ++k)
     {
-        sumRw +=
-            hits.R[k] * hits.E[k];
+        double dR = hits.R[k] - meanR_w;
+        sumR2diff  += dR * dR;
+        sumR2diffW += dR * dR * hits.E[k];
+
+        sumDEta2diffW += hits.dEta[k] * hits.dEta[k] * hits.E[k];
+        sumDPhi2diffW += hits.dPhi[k] * hits.dPhi[k] * hits.E[k];
     }
 
-    const double meanR_w =
-        sumRw / sumEnergy;
+    double R_disp_unweighted = (n > 1) ? sqrt(sumR2diff / (n - 1)) : 0.0;
+    double R_disp_weighted   = sqrt(sumR2diffW / sumEnergy);
+    double Eta_disp_weighted = sqrt(sumDEta2diffW / sumEnergy);
+    double Phi_disp_weighted = sqrt(sumDPhi2diffW / sumEnergy);
 
-
-    double sumR2diff = 0.0;
-    double sumR2diffW = 0.0;
-    double sumDEta2diffW = 0.0;
-    double sumDPhi2diffW = 0.0;
-
-    for (int k = 0; k < n; ++k)
-    {
-        const double dR =
-            hits.R[k] - meanR_w;
-
-        sumR2diff +=
-            dR * dR;
-
-        sumR2diffW +=
-            dR * dR * hits.E[k];
-
-        sumDEta2diffW +=
-            hits.dEta[k] *
-            hits.dEta[k] *
-            hits.E[k];
-
-        sumDPhi2diffW +=
-            hits.dPhi[k] *
-            hits.dPhi[k] *
-            hits.E[k];
-    }
-
-    const double R_disp_unweighted =
-        (n > 1)
-            ? std::sqrt(
-                  sumR2diff / (n - 1)
-              )
-            : 0.0;
-
-    const double R_disp_weighted =
-        std::sqrt(
-            sumR2diffW / sumEnergy
-        );
-
-    const double Eta_disp_weighted =
-        std::sqrt(
-            sumDEta2diffW / sumEnergy
-        );
-
-    const double Phi_disp_weighted =
-        std::sqrt(
-            sumDPhi2diffW / sumEnergy
-        );
-
-
-    f.Energy =
-        static_cast<float>(sumEnergy);
-
-    f.Number =
-        static_cast<float>(n);
-
-    f.EoverP =
-        static_cast<float>(
-            sumEnergy / trackP
-        );
-
-    f.AvgHitEnergy =
-        static_cast<float>(meanE);
-
-    f.SpreadPhi =
-        static_cast<float>(spreadPhi);
-
-    f.SpreadEta =
-        static_cast<float>(spreadEta);
-
-    f.SpreadR =
-        static_cast<float>(spreadR);
-
-    f.MaxHitFrac =
-        static_cast<float>(
-            hits.maxHitE / sumEnergy
-        );
-
-    f.EnergyStdDev =
-        static_cast<float>(energyStdDev);
-
-    f.EnergyConcentration =
-        static_cast<float>(
-            energyConcentration
-        );
-
-    f.R_Disp =
-        static_cast<float>(
-            R_disp_unweighted
-        );
-
-    f.R_DispWeighted =
-        static_cast<float>(
-            R_disp_weighted
-        );
-
-    f.Eta_DispWeighted =
-        static_cast<float>(
-            Eta_disp_weighted
-        );
-
-    f.Phi_DispWeighted =
-        static_cast<float>(
-            Phi_disp_weighted
-        );
-
+    f.Energy              = static_cast<float>(sumEnergy);
+    f.Number              = static_cast<float>(n);
+    f.EoverP              = static_cast<float>(sumEnergy / trackP);
+    f.AvgHitEnergy        = static_cast<float>(meanE);
+    f.SpreadPhi           = static_cast<float>(spreadPhi);
+    f.SpreadEta           = static_cast<float>(spreadEta);
+    f.SpreadR             = static_cast<float>(spreadR);
+    f.MaxHitFrac          = static_cast<float>(hits.maxHitE / sumEnergy);
+    f.EnergyStdDev        = static_cast<float>(energyStdDev);
+    f.EnergyConcentration = static_cast<float>(energyConcentration);
+    f.R_Disp              = static_cast<float>(R_disp_unweighted);
+    f.R_DispWeighted      = static_cast<float>(R_disp_weighted);
+    f.Eta_DispWeighted    = static_cast<float>(Eta_disp_weighted);
+    f.Phi_DispWeighted    = static_cast<float>(Phi_disp_weighted);
     return f;
 }
 
+// =============================================================================
+// ToF (tylko model Low)
+// =============================================================================
+struct BetaEstimate { double beta; bool valid; };
 
-static std::vector<float> HighP_build_raw_features(
-    float ECalEnergy,
-    float HCalEnergy,
-    float ECalNumber,
-    float HCalNumber,
-    float ECalEoverP,
-    float HCalEoverP,
-    float ECalAvgHitEnergy,
-    float HCalAvgHitEnergy,
-    float ECalSpreadPhi,
-    float ECalSpreadEta,
-    float ECalSpreadR,
-    float HCalSpreadPhi,
-    float HCalSpreadEta,
-    float HCalSpreadR,
-    float ECalMaxHitFrac,
-    float HCalMaxHitFrac,
-    float ECalEnergyStdDev,
-    float HCalEnergyStdDev,
-    float ECalEnergyConcentration,
-    float HCalEnergyConcentration,
-    float ECalR_Disp,
-    float ECalR_DispWeighted,
-    float ECalEta_DispWeighted,
-    float ECalPhi_DispWeighted,
-    float HCalR_Disp,
-    float HCalR_DispWeighted,
-    float HCalEta_DispWeighted,
-    float HCalPhi_DispWeighted,
-    float TrackMomentum,
-    float TrackEta)
+inline BetaEstimate CombineBeta(const std::vector<std::pair<double,double>> &hits)
 {
-    return {
-        ECalEnergy,
-        HCalEnergy,
-
-        ECalNumber,
-        HCalNumber,
-
-        ECalEoverP,
-        HCalEoverP,
-
-        ECalAvgHitEnergy,
-        HCalAvgHitEnergy,
-
-        ECalSpreadPhi,
-        ECalSpreadEta,
-        ECalSpreadR,
-
-        HCalSpreadPhi,
-        HCalSpreadEta,
-        HCalSpreadR,
-
-        ECalMaxHitFrac,
-        HCalMaxHitFrac,
-
-        ECalEnergyStdDev,
-        HCalEnergyStdDev,
-
-        ECalEnergyConcentration,
-        HCalEnergyConcentration,
-
-        ECalR_Disp,
-        ECalR_DispWeighted,
-        ECalEta_DispWeighted,
-        ECalPhi_DispWeighted,
-
-        HCalR_Disp,
-        HCalR_DispWeighted,
-        HCalEta_DispWeighted,
-        HCalPhi_DispWeighted,
-
-        TrackMomentum,
-        TrackEta
-    };
-}
-
-
-// ============================================================================
-// ToF
-// ============================================================================
-
-struct BetaEstimate
-{
-    double beta;
-    bool valid;
-};
-
-
-static BetaEstimate CombineBeta(
-    const std::vector<
-        std::pair<double, double>
-    >& hits)
-{
-    double sumXX = 0.0;
-    double sumXT = 0.0;
-
-    for (const auto& h : hits)
-    {
-        const double t = h.first;
-        const double L = h.second;
-
-        const double x =
-            L / c_light;
-
+    double sumXX = 0.0, sumXT = 0.0;
+    for (auto &h : hits) {
+        double t = h.first;
+        double x = h.second / c_light;
         sumXX += x * x;
         sumXT += x * t;
     }
-
-    if (sumXX <= 0.0)
-        return {0.0, false};
-
-    const double u_hat =
-        sumXT / sumXX;
-
-    if (u_hat <= 0.0)
-        return {0.0, false};
-
-    return {
-        1.0 / u_hat,
-        true
-    };
+    if (sumXX <= 0.0) return {0.0, false};
+    double u_hat = sumXT / sumXX;
+    if (u_hat <= 0.0) return {0.0, false};
+    return {1.0 / u_hat, true};
 }
 
-
-struct LowP_TrackToFFeatures
+struct TrackToFFeatures
 {
-    float Beta = -999.f;
-    float MassSq = -999.f;
-
-    float NHitsBarrel = 0.f;
-    float NHitsEndcap = 0.f;
-    float NHitsTotal = 0.f;
-
+    float Beta          = -999.f;
+    float MassSq        = -999.f;
+    float NHitsBarrel   = 0.f;
+    float NHitsEndcap   = 0.f;
+    float NHitsTotal    = 0.f;
     float MinDistBarrel = -999.f;
     float MinDistEndcap = -999.f;
-
-    float AvgLenBarrel = -999.f;
-    float AvgLenEndcap = -999.f;
-
-    float HasToF = 0.f;
+    float AvgLenBarrel  = -999.f;
+    float AvgLenEndcap  = -999.f;
+    float HasToF        = 0.f;
 };
 
+struct TofPoint { double x, y, z, path; };
 
-template <typename HitCollection>
-static LowP_TrackToFFeatures LowP_ComputeToFFeatures(
-    const TLorentzVector& particle,
-    int charge,
-    const HitCollection& barrelHits,
-    const HitCollection& endcapHits,
-    double dR_cut_barrel,
-    double dR_cut_endcap,
-    double dist_cut_barrel,
-    double dist_cut_endcap)
+inline void CollectSegmentTofPoints(const edm4eic::TrackSegmentCollection &segs,
+                                    const edm4eic::Track &trk,
+                                    const TVector3 &ref,
+                                    vector<TofPoint> &barrelPts,
+                                    vector<TofPoint> &endcapPts)
 {
-    LowP_TrackToFFeatures f;
+    for (const auto seg : segs) {
+        if (seg.getTrack() != trk) continue;
+        for (const auto pt : seg.getPoints()) {
+            const double x = pt.position.x, y = pt.position.y, z = pt.position.z;
+            if (CUT_BAD_PATH &&
+                pt.pathlength < (TVector3(x, y, z) - ref).Mag() - L_TOL) continue;
+            if (InBarrelTOF(x, y, z))      barrelPts.push_back({x, y, z, (double)pt.pathlength});
+            else if (InEndcapTOF(x, y, z)) endcapPts.push_back({x, y, z, (double)pt.pathlength});
+        }
+    }
+}
 
-    const double trackEta =
-        particle.Eta();
+inline const TofPoint *NearestPoint(const vector<TofPoint> &pts, const TVector3 &hit, double &dist)
+{
+    const TofPoint *best = nullptr;
+    double bestD = 1e18;
+    for (const auto &p : pts) {
+        double d = std::sqrt((p.x - hit.X())*(p.x - hit.X()) +
+                             (p.y - hit.Y())*(p.y - hit.Y()) +
+                             (p.z - hit.Z())*(p.z - hit.Z()));
+        if (d < bestD) { bestD = d; best = &p; }
+    }
+    dist = bestD;
+    return best;
+}
 
-    const double trackPhi =
-        particle.Phi();
+inline TrackToFFeatures ComputeToFFeatures(
+    const TLorentzVector &Partic,
+    const edm4eic::Track &trk,
+    const TVector3 &ref,
+    const edm4eic::TrackSegmentCollection &segments,
+    const edm4eic::TrackerHitCollection &barrelHits,
+    const edm4eic::TrackerHitCollection &endcapHits,
+    double dR_cut_barrel, double dR_cut_endcap,
+    double dist_cut_barrel, double dist_cut_endcap)
+{
+    TrackToFFeatures f;
 
+    const double vz     = ref.Z();
+    const double tShift = CORRECT_T0 ? T0_PER_MM * vz : 0.0;
 
-    std::vector<
-        std::pair<double, double>
-    > matchedBarrel;
+    vector<TofPoint> barrelPts, endcapPts;
+    CollectSegmentTofPoints(segments, trk, ref, barrelPts, endcapPts);
 
-    std::vector<
-        std::pair<double, double>
-    > matchedEndcap;
+    double trackEta = Partic.Eta();
+    double trackPhi = Partic.Phi();
 
+    std::vector<std::pair<double,double>> matchedBarrel, matchedEndcap; // {time, length}
 
-    double sumLenBarrel = 0.0;
-    double minDistBarrel = 1e18;
+    double sumLenBarrel = 0.0, minDistBarrel = 1e18;
+    double sumLenEndcap = 0.0, minDistEndcap = 1e18;
 
-    double sumLenEndcap = 0.0;
-    double minDistEndcap = 1e18;
+    for (const auto &hit : barrelHits) {
+        auto p = hit.getPosition();
+        TVector3 ToFPos(p.x, p.y, p.z);
+        double dEta = trackEta - ToFPos.Eta();
+        double dPhi = TVector2::Phi_mpi_pi(trackPhi - ToFPos.Phi());
+        double dR   = std::sqrt(dEta*dEta + dPhi*dPhi);
 
-
-    // ------------------------------------------------------------------------
-    // Barrel
-    // ------------------------------------------------------------------------
-
-    for (const auto& hit : barrelHits)
-    {
-        const auto pos =
-            hit.getPosition();
-
-        TVector3 tofPos(
-            pos.x,
-            pos.y,
-            pos.z
-        );
-
-        const double dEta =
-            trackEta - tofPos.Eta();
-
-        const double dPhi =
-            TVector2::Phi_mpi_pi(
-                trackPhi - tofPos.Phi()
-            );
-
-        const double dR =
-            std::sqrt(
-                dEta * dEta +
-                dPhi * dPhi
-            );
-
-
-        if (dR < dR_cut_barrel &&
-            charge * dPhi < 0)
-        {
-            ToFResults tof =
-                ToFSim(
-                    particle,
-                    charge,
-                    tofPos
-                );
-
-            if (tof.distance_to_TOF <
-                dist_cut_barrel)
-            {
-                const double length =
-                    tof.DistanceCheck
-                        ? tof.track_length
-                        : tofPos.Mag();
-
-                matchedBarrel.push_back(
-                    {
-                        hit.getTime(),
-                        length
-                    }
-                );
-
-                sumLenBarrel += length;
-
-                if (tof.distance_to_TOF <
-                    minDistBarrel)
-                {
-                    minDistBarrel =
-                        tof.distance_to_TOF;
-                }
+        if (dR < dR_cut_barrel) {
+            double dist = 0.0;
+            const TofPoint *pt = NearestPoint(barrelPts, ToFPos, dist);
+            if (!pt) continue;
+            if (dist < dist_cut_barrel) {
+                matchedBarrel.push_back({hit.getTime() - tShift, pt->path});
+                sumLenBarrel += pt->path;
+                if (dist < minDistBarrel) minDistBarrel = dist;
             }
         }
     }
 
+    for (const auto &hit : endcapHits) {
+        auto p = hit.getPosition();
+        TVector3 ToFPos(p.x, p.y, p.z);
+        double dEta = trackEta - ToFPos.Eta();
+        double dPhi = TVector2::Phi_mpi_pi(trackPhi - ToFPos.Phi());
+        double dR   = std::sqrt(dEta*dEta + dPhi*dPhi);
 
-    // ------------------------------------------------------------------------
-    // Endcap
-    // ------------------------------------------------------------------------
-
-    for (const auto& hit : endcapHits)
-    {
-        const auto pos =
-            hit.getPosition();
-
-        TVector3 tofPos(
-            pos.x,
-            pos.y,
-            pos.z
-        );
-
-        const double dEta =
-            trackEta - tofPos.Eta();
-
-        const double dPhi =
-            TVector2::Phi_mpi_pi(
-                trackPhi - tofPos.Phi()
-            );
-
-        const double dR =
-            std::sqrt(
-                dEta * dEta +
-                dPhi * dPhi
-            );
-
-
-        if (dR < dR_cut_endcap &&
-            charge * dPhi < 0)
-        {
-            ToFResults tof =
-                ToFSim(
-                    particle,
-                    charge,
-                    tofPos
-                );
-
-            if (tof.distance_to_TOF <
-                dist_cut_endcap)
-            {
-                const double length =
-                    tof.DistanceCheck
-                        ? tof.track_length
-                        : tofPos.Mag();
-
-                matchedEndcap.push_back(
-                    {
-                        hit.getTime(),
-                        length
-                    }
-                );
-
-                sumLenEndcap += length;
-
-                if (tof.distance_to_TOF <
-                    minDistEndcap)
-                {
-                    minDistEndcap =
-                        tof.distance_to_TOF;
-                }
+        if (dR < dR_cut_endcap) {
+            double dist = 0.0;
+            const TofPoint *pt = NearestPoint(endcapPts, ToFPos, dist);
+            if (!pt) continue;
+            if (dist < dist_cut_endcap) {
+                matchedEndcap.push_back({hit.getTime() - tShift, pt->path});
+                sumLenEndcap += pt->path;
+                if (dist < minDistEndcap) minDistEndcap = dist;
             }
         }
     }
 
+    f.NHitsBarrel = (float)matchedBarrel.size();
+    f.NHitsEndcap = (float)matchedEndcap.size();
+    f.NHitsTotal  = f.NHitsBarrel + f.NHitsEndcap;
 
-    // ------------------------------------------------------------------------
-    // Basic ToF quantities
-    // ------------------------------------------------------------------------
+    f.MinDistBarrel = matchedBarrel.empty() ? -999.f : (float)minDistBarrel;
+    f.MinDistEndcap = matchedEndcap.empty() ? -999.f : (float)minDistEndcap;
+    f.AvgLenBarrel  = matchedBarrel.empty() ? -999.f : (float)(sumLenBarrel / matchedBarrel.size());
+    f.AvgLenEndcap  = matchedEndcap.empty() ? -999.f : (float)(sumLenEndcap / matchedEndcap.size());
 
-    f.NHitsBarrel =
-        static_cast<float>(
-            matchedBarrel.size()
-        );
+    std::vector<std::pair<double,double>> allMatched;
+    allMatched.insert(allMatched.end(), matchedBarrel.begin(), matchedBarrel.end());
+    allMatched.insert(allMatched.end(), matchedEndcap.begin(), matchedEndcap.end());
 
-    f.NHitsEndcap =
-        static_cast<float>(
-            matchedEndcap.size()
-        );
-
-    f.NHitsTotal =
-        f.NHitsBarrel +
-        f.NHitsEndcap;
-
-
-    f.MinDistBarrel =
-        matchedBarrel.empty()
-            ? -999.f
-            : static_cast<float>(
-                  minDistBarrel
-              );
-
-    f.MinDistEndcap =
-        matchedEndcap.empty()
-            ? -999.f
-            : static_cast<float>(
-                  minDistEndcap
-              );
-
-
-    f.AvgLenBarrel =
-        matchedBarrel.empty()
-            ? -999.f
-            : static_cast<float>(
-                  sumLenBarrel /
-                  matchedBarrel.size()
-              );
-
-    f.AvgLenEndcap =
-        matchedEndcap.empty()
-            ? -999.f
-            : static_cast<float>(
-                  sumLenEndcap /
-                  matchedEndcap.size()
-              );
-
-
-    // ------------------------------------------------------------------------
-    // Beta and mass^2
-    // ------------------------------------------------------------------------
-
-    std::vector<
-        std::pair<double, double>
-    > allMatched;
-
-    allMatched.insert(
-        allMatched.end(),
-        matchedBarrel.begin(),
-        matchedBarrel.end()
-    );
-
-    allMatched.insert(
-        allMatched.end(),
-        matchedEndcap.begin(),
-        matchedEndcap.end()
-    );
-
-
-    if (!allMatched.empty())
-    {
-        const BetaEstimate be =
-            CombineBeta(allMatched);
-
-        if (be.valid)
-        {
-            const double p =
-                particle.P();
-
-            const double massSq =
-                p * p *
-                (
-                    1.0 /
-                    (be.beta * be.beta)
-                    - 1.0
-                );
-
-            f.Beta =
-                static_cast<float>(
-                    be.beta
-                );
-
-            f.MassSq =
-                static_cast<float>(
-                    massSq
-                );
-
+    if (!allMatched.empty()) {
+        BetaEstimate be = CombineBeta(allMatched);
+        if (be.valid) {
+            double p = Partic.P();
+            double msq = p*p * (1.0/(be.beta*be.beta) - 1.0);
+            f.Beta   = (float)be.beta;
+            f.MassSq = (float)msq;
             f.HasToF = 1.f;
         }
     }
-
     return f;
 }
 
-
-// ============================================================================
-// LOW-P raw-feature vector: full calo shower-shape (same computation as
-// HighP, via HighP_CollectHits / HighP_ComputeTrackFeatures) for BOTH ECal
-// and HCal, plus ToF, plus track kinematics. 41 values, in exactly the
-// RAW_COLS order used by CombinedCaloToFAnalysis.cxx / TrainMuonID.py:
-//
-//   ECal: Energy, Number, EoverP, AvgHitEnergy, SpreadPhi, SpreadEta,
-//         SpreadR, MaxHitFrac, EnergyStdDev, EnergyConcentration, R_Disp,
-//         R_DispWeighted, Eta_DispWeighted, Phi_DispWeighted   (14)
-//   HCal: same 14 fields
-//   ToF:  Beta, MassSq, NHitsBarrel, NHitsEndcap, NHitsTotal, MinDistBarrel,
-//         MinDistEndcap, AvgLenBarrel, AvgLenEndcap, HasToF   (10)
-//   Track: Momentum, Eta, Phi   (3)
-//
-// Sentinel convention (must match the training pipeline exactly): Energy
-// and Number stay real (0 when a subsystem had no hits); every other calo
-// shower-shape field becomes MISSING_SENTINEL when Number<=0 for that
-// subsystem. The ONNX preprocessing node does the sentinel imputation
-// internally, so we must pass the raw sentinel through, not pre-impute it.
-// ============================================================================
-
-struct LowP_CaloRaw
+// =============================================================================
+// ONNX - sesje tworzone leniwie przy pierwszym wywolaniu
+// =============================================================================
+struct OnnxModels
 {
-    float Energy, Number, EoverP, AvgHitEnergy, SpreadPhi, SpreadEta, SpreadR,
-          MaxHitFrac, EnergyStdDev, EnergyConcentration, R_Disp, R_DispWeighted,
-          Eta_DispWeighted, Phi_DispWeighted;
+    Ort::Env            env;
+    Ort::SessionOptions so;
+    unique_ptr<Ort::Session> low;
+    unique_ptr<Ort::Session> high;
+    Ort::MemoryInfo     mem;
+
+    static Ort::SessionOptions MakeOptions()
+    {
+        Ort::SessionOptions o;
+        o.SetIntraOpNumThreads(1);
+        o.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        return o;
+    }
+
+    OnnxModels()
+        : env(ORT_LOGGING_LEVEL_WARNING, "MuonID"),
+          so(MakeOptions()),
+          mem(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault))
+    {
+        const char *lowPath  = getenv("MUONID_LOW_MODEL")  ? getenv("MUONID_LOW_MODEL")  : MUONID_LOW_MODEL_DEFAULT;
+        const char *highPath = getenv("MUONID_HIGH_MODEL") ? getenv("MUONID_HIGH_MODEL") : MUONID_HIGH_MODEL_DEFAULT;
+        cout << "[MuonID] Low model : " << lowPath  << endl;
+        cout << "[MuonID] High model: " << highPath << endl;
+        low  = make_unique<Ort::Session>(env, lowPath,  so);
+        high = make_unique<Ort::Session>(env, highPath, so);
+    }
 };
 
-static LowP_CaloRaw LowP_ApplySentinel(const HighP_TrackFeatures& f)
+inline OnnxModels &Models()
 {
-    const bool hasHits = f.Number > 0.f;
-    LowP_CaloRaw r;
-    r.Energy               = f.Energy;
-    r.Number                = f.Number;
-    r.EoverP                = hasHits ? f.EoverP : MISSING_SENTINEL;
-    r.AvgHitEnergy           = hasHits ? f.AvgHitEnergy : MISSING_SENTINEL;
-    r.SpreadPhi              = hasHits ? f.SpreadPhi : MISSING_SENTINEL;
-    r.SpreadEta              = hasHits ? f.SpreadEta : MISSING_SENTINEL;
-    r.SpreadR                = hasHits ? f.SpreadR : MISSING_SENTINEL;
-    r.MaxHitFrac             = hasHits ? f.MaxHitFrac : MISSING_SENTINEL;
-    r.EnergyStdDev           = hasHits ? f.EnergyStdDev : MISSING_SENTINEL;
-    r.EnergyConcentration    = hasHits ? f.EnergyConcentration : MISSING_SENTINEL;
-    r.R_Disp                 = hasHits ? f.R_Disp : MISSING_SENTINEL;
-    r.R_DispWeighted          = hasHits ? f.R_DispWeighted : MISSING_SENTINEL;
-    r.Eta_DispWeighted        = hasHits ? f.Eta_DispWeighted : MISSING_SENTINEL;
-    r.Phi_DispWeighted        = hasHits ? f.Phi_DispWeighted : MISSING_SENTINEL;
-    return r;
+    static OnnxModels m;   // inicjalizacja przy pierwszym uzyciu
+    return m;
 }
 
-static std::vector<float> LowP_build_raw_features(
-    float ECalEnergy, float ECalNumber, float ECalEoverP, float ECalAvgHitEnergy,
-    float ECalSpreadPhi, float ECalSpreadEta, float ECalSpreadR, float ECalMaxHitFrac,
-    float ECalEnergyStdDev, float ECalEnergyConcentration,
-    float ECalR_Disp, float ECalR_DispWeighted, float ECalEta_DispWeighted, float ECalPhi_DispWeighted,
+inline float RunSession(Ort::Session &session, Ort::MemoryInfo &mem, const std::vector<float> &raw)
+{
+    int64_t shape[2] = {1, static_cast<int64_t>(raw.size())};
 
-    float HCalEnergy, float HCalNumber, float HCalEoverP, float HCalAvgHitEnergy,
-    float HCalSpreadPhi, float HCalSpreadEta, float HCalSpreadR, float HCalMaxHitFrac,
-    float HCalEnergyStdDev, float HCalEnergyConcentration,
-    float HCalR_Disp, float HCalR_DispWeighted, float HCalEta_DispWeighted, float HCalPhi_DispWeighted,
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        mem, const_cast<float*>(raw.data()), raw.size(), shape, 2);
 
-    float ToFBeta, float ToFMassSq, float ToFNHitsBarrel, float ToFNHitsEndcap, float ToFNHitsTotal,
-    float ToFMinDistBarrel, float ToFMinDistEndcap, float ToFAvgLenBarrel, float ToFAvgLenEndcap, float ToFHasToF,
+    const char* input_names[]  = {"raw_features"};
+    const char* output_names[] = {"probabilities"};
 
-    float TrackMomentum, float TrackEta, float TrackPhi)
+    auto output = session.Run(Ort::RunOptions{nullptr},
+                              input_names, &input_tensor, 1,
+                              output_names, 1);
+
+    float* probs = output[0].GetTensorMutableData<float>();
+    return probs[1];   // P(muon)
+}
+
+// 41 cech (model LowP)
+inline std::vector<float> BuildRawLow(const TrackFeatures &e, const TrackFeatures &h,
+                                      const TrackToFFeatures &t,
+                                      double trackP, double trackEta, double trackPhi)
+{
+    auto E = [&](float v) { return (e.Number > 0) ? v : MISSING_SENTINEL; };
+    auto H = [&](float v) { return (h.Number > 0) ? v : MISSING_SENTINEL; };
+    auto T = [&](float v) { return (t.HasToF > 0.5f) ? v : MISSING_SENTINEL; };
+
+    return {
+        e.Energy, e.Number, E(e.EoverP), E(e.AvgHitEnergy),
+        E(e.SpreadPhi), E(e.SpreadEta), E(e.SpreadR), E(e.MaxHitFrac),
+        E(e.EnergyStdDev), E(e.EnergyConcentration),
+        E(e.R_Disp), E(e.R_DispWeighted), E(e.Eta_DispWeighted), E(e.Phi_DispWeighted),
+
+        h.Energy, h.Number, H(h.EoverP), H(h.AvgHitEnergy),
+        H(h.SpreadPhi), H(h.SpreadEta), H(h.SpreadR), H(h.MaxHitFrac),
+        H(h.EnergyStdDev), H(h.EnergyConcentration),
+        H(h.R_Disp), H(h.R_DispWeighted), H(h.Eta_DispWeighted), H(h.Phi_DispWeighted),
+
+        T(t.Beta), T(t.MassSq), t.NHitsBarrel, t.NHitsEndcap, t.NHitsTotal,
+        T(t.MinDistBarrel), T(t.MinDistEndcap), T(t.AvgLenBarrel), T(t.AvgLenEndcap), t.HasToF,
+
+        static_cast<float>(trackP), static_cast<float>(trackEta), static_cast<float>(trackPhi)
+    };
+}
+
+// 30 cech (model HighP) - bez sentineli
+inline std::vector<float> BuildRawHigh(const TrackFeatures &e, const TrackFeatures &h,
+                                       double trackP, double trackEta)
 {
     return {
-        ECalEnergy, ECalNumber, ECalEoverP, ECalAvgHitEnergy,
-        ECalSpreadPhi, ECalSpreadEta, ECalSpreadR, ECalMaxHitFrac,
-        ECalEnergyStdDev, ECalEnergyConcentration,
-        ECalR_Disp, ECalR_DispWeighted, ECalEta_DispWeighted, ECalPhi_DispWeighted,
-
-        HCalEnergy, HCalNumber, HCalEoverP, HCalAvgHitEnergy,
-        HCalSpreadPhi, HCalSpreadEta, HCalSpreadR, HCalMaxHitFrac,
-        HCalEnergyStdDev, HCalEnergyConcentration,
-        HCalR_Disp, HCalR_DispWeighted, HCalEta_DispWeighted, HCalPhi_DispWeighted,
-
-        ToFBeta, ToFMassSq, ToFNHitsBarrel, ToFNHitsEndcap, ToFNHitsTotal,
-        ToFMinDistBarrel, ToFMinDistEndcap, ToFAvgLenBarrel, ToFAvgLenEndcap, ToFHasToF,
-
-        TrackMomentum, TrackEta, TrackPhi
+        e.Energy, h.Energy,
+        e.Number, h.Number,
+        e.EoverP, h.EoverP,
+        e.AvgHitEnergy, h.AvgHitEnergy,
+        e.SpreadPhi, e.SpreadEta, e.SpreadR,
+        h.SpreadPhi, h.SpreadEta, h.SpreadR,
+        e.MaxHitFrac, h.MaxHitFrac,
+        e.EnergyStdDev, h.EnergyStdDev,
+        e.EnergyConcentration, h.EnergyConcentration,
+        e.R_Disp, e.R_DispWeighted,
+        e.Eta_DispWeighted, e.Phi_DispWeighted,
+        h.R_Disp, h.R_DispWeighted,
+        h.Eta_DispWeighted, h.Phi_DispWeighted,
+        static_cast<float>(trackP), static_cast<float>(trackEta)
     };
 }
 
+} // namespace MuonIDImpl
 
-// ============================================================================
-// Find the MC particle associated with this reconstructed particle
-//
-// This is needed because the original testing macro obtained simPart from
-//
-//   trackAssocs[particle].getSim()
-//
-// but MuonID itself receives only:
-//
-//   (rcp, event)
-//
-// Therefore the association lookup has to happen inside MuonID.
-//
-// ============================================================================
-
-static edm4hep::MCParticle FindSimParticle(
-    const edm4eic::ReconstructedParticle& rcp,
-    const podio::Frame& frame)
+// =============================================================================
+// MuonID - glowna funkcja
+// =============================================================================
+// Zwraca P(muon). Gdy hasDetectorInfo == false, trak nie moze byc ocenony
+// (zwracane 0.f).
+inline float MuonID(const edm4eic::ReconstructedParticle &rcp,
+                    const podio::Frame *event,
+                    bool *hasDetectorInfo = nullptr)
 {
-    const auto& associations =
-        frame.get<
-            edm4eic::MCRecoParticleAssociationCollection
-        >("ReconstructedChargedParticleAssociations");
+    using namespace MuonIDImpl;
 
-    for (const auto& assoc : associations)
-    {
-        if (assoc.getRec() == rcp)
-        {
-            return assoc.getSim();
-        }
-    }
+    if (hasDetectorInfo) *hasDetectorInfo = false;
+    if (!event) return 0.f;
 
-    // Invalid MCParticle handle if no association was found.
-    return edm4hep::MCParticle();
-}
+    const podio::Frame &frame = *event;
 
+    auto mom = rcp.getMomentum();
+    TLorentzVector Partic;
+    Partic.SetPxPyPzE(mom.x, mom.y, mom.z, rcp.getEnergy());
+    const double trackP   = Partic.P();
+    const double trackEta = Partic.Eta();
+    const double trackPhi = Partic.Phi();
 
-// ============================================================================
-// Main MuonID function
-// ============================================================================
+    if (trackP <= 0) return 0.f;
 
-float MuonID(
-    const edm4eic::ReconstructedParticle& rcp,
-    const podio::Frame* event,
-    bool* hasDetectorInfo = nullptr)
-{
-    // ------------------------------------------------------------------------
-    // Default: "no usable info" until proven otherwise below.
-    // ------------------------------------------------------------------------
+    const bool useLow = (trackP <= P_SPLIT_GEV);
 
-    if (hasDetectorInfo != nullptr)
-        *hasDetectorInfo = false;
+    // Dostepne kolekcje w tym evencie (czytane tylko to, co podano w readEntry)
+    const vector<string> avail = frame.getAvailableCollections();
 
-
-    // ------------------------------------------------------------------------
-    // Basic validity check
-    // ------------------------------------------------------------------------
-
-    if (event == nullptr)
-        return 0.0f;
-
-
-    // ------------------------------------------------------------------------
-    // Reconstructed particle kinematics
-    // ------------------------------------------------------------------------
-
-    const auto mom =
-        rcp.getMomentum();
-
-    TLorentzVector particle;
-
-    particle.SetPxPyPzE(
-        mom.x,
-        mom.y,
-        mom.z,
-        rcp.getEnergy()
-    );
-
-
-    const double trackP =
-        particle.P();
-
-    const double trackEta =
-        particle.Eta();
-
-    const double trackPhi =
-        particle.Phi();
-
-
-    if (trackP <= 0.0)
-        return 0.0f;
-
-
-    // ------------------------------------------------------------------------
-    // MC association
-    //
-    // The current feature implementation uses the MC particle to find
-    // calorimeter clusters associated with the track.
-    // ------------------------------------------------------------------------
-
-    const edm4hep::MCParticle simPart =
-        FindSimParticle(
-            rcp,
-            *event
-        );
-
-
-
-
-    // ------------------------------------------------------------------------
-    // Detector collections
-    // ------------------------------------------------------------------------
-
-    const std::vector<DetectorAssoc> ecalDetectors = {
-        MakeDetectorAssoc(
-            "EcalBarrelImagingClusters"
-        ),
-        MakeDetectorAssoc(
-            "EcalBarrelScFiClusters"
-        ),
-        MakeDetectorAssoc(
-            "EcalEndcapPClusters"
-        ),
-        MakeDetectorAssoc(
-            "EcalEndcapNClusters"
-        )
+    static const vector<DetectorAssoc> hcalDetectors = {
+        MakeDetectorAssoc("HcalBarrelClusters"),
+        MakeDetectorAssoc("HcalEndcapNClusters"),
+        MakeDetectorAssoc("LFHCALClusters")
     };
+    static const vector<DetectorAssoc> ecalDetectors;   // ECal z rcp.getClusters()
 
+    // ECal / HCal (wspolne)
+    TrackCalHits ecalHits = CollectHits(rcp, ecalDetectors, frame, avail, true,  Partic);
+    TrackCalHits hcalHits = CollectHits(rcp, hcalDetectors, frame, avail, false, Partic);
+    TrackFeatures ecalF = ComputeTrackFeatures(ecalHits, trackP);
+    TrackFeatures hcalF = ComputeTrackFeatures(hcalHits, trackP);
 
-    const std::vector<DetectorAssoc> hcalDetectors = {
-        MakeDetectorAssoc(
-            "HcalBarrelClusters"
-        ),
-        MakeDetectorAssoc(
-            "HcalEndcapNClusters"
-        ),
-        MakeDetectorAssoc(
-            "LFHCALClusters"
-        )
-    };
+    auto &M = Models();
+    float Pmu = 0.f;
 
-
-    // =========================================================================
-    // LOW-P
-    // =========================================================================
-
-    if (trackP < P_SPLIT_GEV)
+    if (useLow)
     {
-        // ---------------------------------------------------------------------
-        // Get ToF collections
-        // ---------------------------------------------------------------------
+        // --- model LowP: wymaga tracka (HCal TCM + ToF) ---
+        if (rcp.getTracks().empty()) return 0.f;
+        const auto trk = rcp.getTracks().at(0);
 
-        const auto& tofBarrelHits =
-            event->get<
-                edm4eic::TrackerHitCollection
-            >("TOFBarrelRecHits");
+        const auto rp = rcp.getReferencePoint();
+        TVector3 refPoint(rp.x, rp.y, rp.z);
 
-        const auto& tofEndcapHits =
-            event->get<
-                edm4eic::TrackerHitCollection
-            >("TOFEndcapRecHits");
+        static const edm4eic::TrackerHitCollection   emptyToF;
+        static const edm4eic::TrackSegmentCollection emptySeg;
 
+        const bool hasBToF = HasCollection(avail, "TOFBarrelSharedRecHits");
+        const bool hasEToF = HasCollection(avail, "TOFEndcapSharedRecHits");
+        const bool hasSeg  = HasCollection(avail, SEG_COLL);
 
-        // ---------------------------------------------------------------------
-        // ECal (full shower-shape set, same computation as HighP)
-        // ---------------------------------------------------------------------
+        const auto &barrelToF = hasBToF ? frame.get<edm4eic::TrackerHitCollection>("TOFBarrelSharedRecHits") : emptyToF;
+        const auto &endcapToF = hasEToF ? frame.get<edm4eic::TrackerHitCollection>("TOFEndcapSharedRecHits") : emptyToF;
+        const auto &segments  = hasSeg  ? frame.get<edm4eic::TrackSegmentCollection>(SEG_COLL)             : emptySeg;
 
-        const HighP_TrackCalHits ecalHits =
-            HighP_CollectHits(
-                simPart,
-                ecalDetectors,
-                *event,
-                particle,
-                TIMING_CUT_NS
-            );
+        TrackToFFeatures tofF = ComputeToFFeatures(
+            Partic, trk, refPoint, segments, barrelToF, endcapToF,
+            DR_CUT_BARREL, DR_CUT_ENDCAP, DIST_CUT_BARREL, DIST_CUT_ENDCAP);
 
-        const HighP_TrackFeatures ecalF =
-            HighP_ComputeTrackFeatures(
-                ecalHits,
-                trackP
-            );
+        if (ecalF.Number <= 0 && hcalF.Number <= 0 && tofF.HasToF < 0.5) return 0.f;
 
-
-        // ---------------------------------------------------------------------
-        // HCal (full shower-shape set, same computation as HighP)
-        // ---------------------------------------------------------------------
-
-        const HighP_TrackCalHits hcalHits =
-            HighP_CollectHits(
-                simPart,
-                hcalDetectors,
-                *event,
-                particle,
-                TIMING_CUT_NS
-            );
-
-        const HighP_TrackFeatures hcalF =
-            HighP_ComputeTrackFeatures(
-                hcalHits,
-                trackP
-            );
-
-
-        // ---------------------------------------------------------------------
-        // ToF
-        // ---------------------------------------------------------------------
-
-        const int charge =
-            static_cast<int>(
-                rcp.getCharge()
-            );
-
-        const LowP_TrackToFFeatures tofF =
-            LowP_ComputeToFFeatures(
-                particle,
-                charge,
-                tofBarrelHits,
-                tofEndcapHits,
-                0.8,   // dR barrel
-                0.8,   // dR endcap
-                6.0,   // distance barrel
-                6.0    // distance endcap
-            );
-
-
-        // ---------------------------------------------------------------------
-        // No useful detector information -> not "found" for ID purposes.
-        // ---------------------------------------------------------------------
-
-        if (ecalF.Number <= 0.0f &&
-            hcalF.Number <= 0.0f &&
-            tofF.HasToF < 0.5f)
-        {
-            return 0.0f;
-        }
-
-        if (hasDetectorInfo != nullptr)
-            *hasDetectorInfo = true;
-
-
-        // ---------------------------------------------------------------------
-        // Missing-value treatment (sentinel), full calo shower-shape set.
-        // ---------------------------------------------------------------------
-
-        const LowP_CaloRaw ecalR = LowP_ApplySentinel(ecalF);
-        const LowP_CaloRaw hcalR = LowP_ApplySentinel(hcalF);
-
-
-        // ---------------------------------------------------------------------
-        // 41-feature LowP vector
-        // ---------------------------------------------------------------------
-
-        const std::vector<float> raw =
-            LowP_build_raw_features(
-                ecalR.Energy, ecalR.Number, ecalR.EoverP, ecalR.AvgHitEnergy,
-                ecalR.SpreadPhi, ecalR.SpreadEta, ecalR.SpreadR, ecalR.MaxHitFrac,
-                ecalR.EnergyStdDev, ecalR.EnergyConcentration,
-                ecalR.R_Disp, ecalR.R_DispWeighted, ecalR.Eta_DispWeighted, ecalR.Phi_DispWeighted,
-
-                hcalR.Energy, hcalR.Number, hcalR.EoverP, hcalR.AvgHitEnergy,
-                hcalR.SpreadPhi, hcalR.SpreadEta, hcalR.SpreadR, hcalR.MaxHitFrac,
-                hcalR.EnergyStdDev, hcalR.EnergyConcentration,
-                hcalR.R_Disp, hcalR.R_DispWeighted, hcalR.Eta_DispWeighted, hcalR.Phi_DispWeighted,
-
-                tofF.Beta, tofF.MassSq, tofF.NHitsBarrel, tofF.NHitsEndcap, tofF.NHitsTotal,
-                tofF.MinDistBarrel, tofF.MinDistEndcap, tofF.AvgLenBarrel, tofF.AvgLenEndcap, tofF.HasToF,
-
-                static_cast<float>(trackP),
-                static_cast<float>(trackEta),
-                static_cast<float>(trackPhi)
-            );
-
-
-        // ---------------------------------------------------------------------
-        // LowP ONNX inference
-        //
-        // Initialized once, not once per particle.
-        // ---------------------------------------------------------------------
-
-        static Ort::Env env(
-            ORT_LOGGING_LEVEL_WARNING,
-            "MuonID"
-        );
-
-        static Ort::SessionOptions options;
-
-        static std::unique_ptr<Ort::Session> session =
-            []()
-            {
-                Ort::SessionOptions opts;
-
-                opts.SetIntraOpNumThreads(1);
-
-                opts.SetGraphOptimizationLevel(
-                    GraphOptimizationLevel::
-                        ORT_ENABLE_EXTENDED
-                );
-
-                return std::make_unique<Ort::Session>(
-                    env,
-                    LOWP_ONNX_PATH,
-                    opts
-                );
-            }();
-
-
-        static Ort::MemoryInfo memoryInfo =
-            Ort::MemoryInfo::CreateCpu(
-                OrtArenaAllocator,
-                OrtMemTypeDefault
-            );
-
-
-        return run_muon_id(
-            *session,
-            memoryInfo,
-            raw
-        );
+        std::vector<float> raw = BuildRawLow(ecalF, hcalF, tofF, trackP, trackEta, trackPhi);
+        Pmu = RunSession(*M.low, M.mem, raw);
     }
-
-
-    // =========================================================================
-    // HIGH-P
-    // =========================================================================
-
     else
     {
-        // ---------------------------------------------------------------------
-        // ECal
-        // ---------------------------------------------------------------------
+        // --- model HighP: tylko Calo ---
+        if (ecalF.Number <= 0 && hcalF.Number <= 0) return 0.f;
 
-        const HighP_TrackCalHits ecalHits =
-            HighP_CollectHits(
-                simPart,
-                ecalDetectors,
-                *event,
-                particle,
-                TIMING_CUT_NS
-            );
-
-        const HighP_TrackFeatures ecalF =
-            HighP_ComputeTrackFeatures(
-                ecalHits,
-                trackP
-            );
-
-
-        // ---------------------------------------------------------------------
-        // HCal
-        // ---------------------------------------------------------------------
-
-        const HighP_TrackCalHits hcalHits =
-            HighP_CollectHits(
-                simPart,
-                hcalDetectors,
-                *event,
-                particle,
-                TIMING_CUT_NS
-            );
-
-        const HighP_TrackFeatures hcalF =
-            HighP_ComputeTrackFeatures(
-                hcalHits,
-                trackP
-            );
-
-
-        // ---------------------------------------------------------------------
-        // No calorimeter information -> not "found" for ID purposes.
-        // ---------------------------------------------------------------------
-
-        if (ecalF.Number <= 0.0f &&
-            hcalF.Number <= 0.0f)
-        {
-            return 0.0f;
-        }
-
-        if (hasDetectorInfo != nullptr)
-            *hasDetectorInfo = true;
-
-
-        // ---------------------------------------------------------------------
-        // 29-feature HighP vector
-        // ---------------------------------------------------------------------
-
-        const std::vector<float> raw =
-            HighP_build_raw_features(
-                ecalF.Energy,
-                hcalF.Energy,
-
-                ecalF.Number,
-                hcalF.Number,
-
-                ecalF.EoverP,
-                hcalF.EoverP,
-
-                ecalF.AvgHitEnergy,
-                hcalF.AvgHitEnergy,
-
-                ecalF.SpreadPhi,
-                ecalF.SpreadEta,
-                ecalF.SpreadR,
-
-                hcalF.SpreadPhi,
-                hcalF.SpreadEta,
-                hcalF.SpreadR,
-
-                ecalF.MaxHitFrac,
-                hcalF.MaxHitFrac,
-
-                ecalF.EnergyStdDev,
-                hcalF.EnergyStdDev,
-
-                ecalF.EnergyConcentration,
-                hcalF.EnergyConcentration,
-
-                ecalF.R_Disp,
-                ecalF.R_DispWeighted,
-                ecalF.Eta_DispWeighted,
-                ecalF.Phi_DispWeighted,
-
-                hcalF.R_Disp,
-                hcalF.R_DispWeighted,
-                hcalF.Eta_DispWeighted,
-                hcalF.Phi_DispWeighted,
-
-                static_cast<float>(trackP),
-                static_cast<float>(trackEta)
-            );
-
-
-        // ---------------------------------------------------------------------
-        // HighP ONNX inference
-        // ---------------------------------------------------------------------
-
-        static Ort::Env env(
-            ORT_LOGGING_LEVEL_WARNING,
-            "MuonID"
-        );
-
-        static std::unique_ptr<Ort::Session> session =
-            []()
-            {
-                Ort::SessionOptions opts;
-
-                return std::make_unique<Ort::Session>(
-                    env,
-                    HIGHP_ONNX_PATH,
-                    opts
-                );
-            }();
-
-
-        static Ort::MemoryInfo memoryInfo =
-            Ort::MemoryInfo::CreateCpu(
-                OrtArenaAllocator,
-                OrtMemTypeDefault
-            );
-
-
-        return run_muon_id(
-            *session,
-            memoryInfo,
-            raw
-        );
+        std::vector<float> raw = BuildRawHigh(ecalF, hcalF, trackP, trackEta);
+        Pmu = RunSession(*M.high, M.mem, raw);
     }
+
+    if (hasDetectorInfo) *hasDetectorInfo = true;
+    return Pmu;
 }
